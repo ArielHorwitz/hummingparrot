@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::api::GptMessage;
 use crate::state::State;
 use crate::ui::{UiState, ViewTab};
@@ -7,6 +9,98 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 const API_ERROR_FEEDBACK: &str = "An error occured, see debug logs.";
 const API_ERROR_SYSTEM_MESSAGE: &str = "Failed to get a response from the assistant.";
 const MESSAGE_FILE: &str = ".local/share/hummingparrot/message_text";
+
+#[derive(Debug)]
+pub enum HotkeyAction {
+    NextTab,
+    ToggleDebug,
+    IncrementTempurature,
+    DecrementTempurature,
+    IncrementTopP,
+    DecrementTopP,
+    IncrementFrequencyPenalty,
+    DecrementFrequencyPenalty,
+    IncrementPresencePenalty,
+    DecrementPresencePenalty,
+    SendPrompt,
+    GetMessageFromEditor,
+    ViewConfigTab,
+    ViewConversationTab,
+    QuitProgram,
+}
+
+#[derive(Debug)]
+pub struct HotkeyMap {
+    pub keymap: HashMap<(KeyCode, KeyModifiers), HotkeyAction>,
+}
+
+impl Default for HotkeyMap {
+    fn default() -> Self {
+        let mut keymap = HashMap::new();
+        keymap.insert(
+            (KeyCode::Char('d'), KeyModifiers::NONE),
+            HotkeyAction::ToggleDebug,
+        );
+        keymap.insert(
+            (KeyCode::Char('t'), KeyModifiers::NONE),
+            HotkeyAction::IncrementTempurature,
+        );
+        keymap.insert(
+            (KeyCode::Char('T'), KeyModifiers::SHIFT),
+            HotkeyAction::DecrementTempurature,
+        );
+        keymap.insert(
+            (KeyCode::Char('p'), KeyModifiers::NONE),
+            HotkeyAction::IncrementTopP,
+        );
+        keymap.insert(
+            (KeyCode::Char('P'), KeyModifiers::SHIFT),
+            HotkeyAction::DecrementTopP,
+        );
+        keymap.insert(
+            (KeyCode::Char('f'), KeyModifiers::NONE),
+            HotkeyAction::IncrementFrequencyPenalty,
+        );
+        keymap.insert(
+            (KeyCode::Char('F'), KeyModifiers::SHIFT),
+            HotkeyAction::DecrementFrequencyPenalty,
+        );
+        keymap.insert(
+            (KeyCode::Char('r'), KeyModifiers::NONE),
+            HotkeyAction::IncrementPresencePenalty,
+        );
+        keymap.insert(
+            (KeyCode::Char('R'), KeyModifiers::SHIFT),
+            HotkeyAction::DecrementPresencePenalty,
+        );
+        keymap.insert(
+            (KeyCode::Enter, KeyModifiers::ALT),
+            HotkeyAction::SendPrompt,
+        );
+        keymap.insert(
+            (KeyCode::Char('e'), KeyModifiers::ALT),
+            HotkeyAction::GetMessageFromEditor,
+        );
+        keymap.insert(
+            (KeyCode::Char('q'), KeyModifiers::CONTROL),
+            HotkeyAction::QuitProgram,
+        );
+        keymap.insert(
+            (KeyCode::BackTab, KeyModifiers::SHIFT),
+            HotkeyAction::NextTab,
+        );
+        for keymod in [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ] {
+            keymap.insert((KeyCode::F(1), keymod), HotkeyAction::ViewConversationTab);
+            keymap.insert((KeyCode::F(2), keymod), HotkeyAction::ViewConfigTab);
+        }
+        HotkeyMap { keymap }
+    }
+}
 
 pub enum HandleEventResult {
     None,
@@ -18,13 +112,14 @@ pub async fn handle_events(
     timeout: u64,
     state: &mut State,
     ui_state: &mut UiState<'_>,
+    keymap: &HotkeyMap,
 ) -> Result<HandleEventResult> {
     if !event::poll(std::time::Duration::from_millis(timeout)).context("poll terminal events")? {
         return Ok(HandleEventResult::None);
     };
     let terminal_event = event::read().context("read terminal event")?;
     match terminal_event {
-        Event::Key(key_event) => return handle_keys(key_event, state, ui_state).await,
+        Event::Key(key_event) => return handle_keys(key_event, state, ui_state, keymap).await,
         Event::FocusGained => ui_state.status_bar_text = String::from("focus gained"),
         Event::FocusLost => ui_state.status_bar_text = String::from("focus lost"),
         Event::Mouse(ev) => ui_state.status_bar_text = format!("mouse {ev:#?}"),
@@ -38,25 +133,43 @@ async fn handle_keys(
     key_event: KeyEvent,
     state: &mut State,
     ui_state: &mut UiState<'_>,
+    keymap: &HotkeyMap,
 ) -> Result<HandleEventResult> {
     if key_event.kind != KeyEventKind::Press {
         return Ok(HandleEventResult::None);
     }
     ui_state.key_event_debug = format!("{:?} {:?}", key_event.modifiers, key_event.code);
-    match (key_event.code, key_event.modifiers) {
-        (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Ok(HandleEventResult::Quit),
-        (KeyCode::BackTab, KeyModifiers::SHIFT) => ui_state.tab = ui_state.tab.next_tab(),
-        (KeyCode::F(1), _) => ui_state.tab = ViewTab::Conversation,
-        (KeyCode::F(2), _) => ui_state.tab = ViewTab::Config,
+    let is_hotkey = keymap.keymap.get(&(key_event.code, key_event.modifiers));
+    match (is_hotkey, key_event.code, key_event.modifiers) {
+        (Some(hotkey_action), _, _) => match hotkey_action {
+            HotkeyAction::QuitProgram => return Ok(HandleEventResult::Quit),
+            HotkeyAction::NextTab => ui_state.tab = ui_state.tab.next_tab(),
+            HotkeyAction::ViewConversationTab => ui_state.tab = ViewTab::Conversation,
+            HotkeyAction::ViewConfigTab => ui_state.tab = ViewTab::Config,
+            _ => {
+                return match ui_state.tab {
+                    ViewTab::Conversation => {
+                        handle_conversation_keys(key_event, state, ui_state, keymap)
+                            .await
+                            .context("handle conversation keys")
+                    }
+                    ViewTab::Config => handle_config_keys(key_event, state, ui_state, keymap)
+                        .await
+                        .context("handle config keys"),
+                }
+            }
+        },
         _ => {
             return match ui_state.tab {
-                ViewTab::Conversation => handle_conversation_keys(key_event, state, ui_state)
-                    .await
-                    .context("handle conversation keys"),
-                ViewTab::Config => handle_config_keys(key_event, state, ui_state)
+                ViewTab::Conversation => {
+                    handle_conversation_keys(key_event, state, ui_state, keymap)
+                        .await
+                        .context("handle conversation keys")
+                }
+                ViewTab::Config => handle_config_keys(key_event, state, ui_state, keymap)
                     .await
                     .context("handle config keys"),
-            };
+            }
         }
     };
     Ok(HandleEventResult::None)
@@ -66,17 +179,22 @@ async fn handle_config_keys(
     key_event: KeyEvent,
     state: &mut State,
     ui_state: &mut UiState<'_>,
+    keymap: &HotkeyMap,
 ) -> Result<HandleEventResult> {
-    match (key_event.code, key_event.modifiers) {
-        (KeyCode::Char('d'), KeyModifiers::NONE) => ui_state.debug = !ui_state.debug,
-        (KeyCode::Char('t'), KeyModifiers::NONE) => state.config.chat.temperature += 0.05,
-        (KeyCode::Char('T'), KeyModifiers::SHIFT) => state.config.chat.temperature -= 0.05,
-        (KeyCode::Char('p'), KeyModifiers::NONE) => state.config.chat.top_p += 0.05,
-        (KeyCode::Char('P'), KeyModifiers::SHIFT) => state.config.chat.top_p -= 0.05,
-        (KeyCode::Char('f'), KeyModifiers::NONE) => state.config.chat.frequency_penalty += 0.05,
-        (KeyCode::Char('F'), KeyModifiers::SHIFT) => state.config.chat.frequency_penalty -= 0.05,
-        (KeyCode::Char('r'), KeyModifiers::NONE) => state.config.chat.presence_penalty += 0.05,
-        (KeyCode::Char('R'), KeyModifiers::SHIFT) => state.config.chat.presence_penalty -= 0.05,
+    let is_hotkey = keymap.keymap.get(&(key_event.code, key_event.modifiers));
+    match (is_hotkey, key_event.code, key_event.modifiers) {
+        (Some(hotkey_action), _, _) => match *hotkey_action {
+            HotkeyAction::ToggleDebug => ui_state.debug = !ui_state.debug,
+            HotkeyAction::IncrementTempurature => state.config.chat.temperature += 0.05,
+            HotkeyAction::DecrementTempurature => state.config.chat.temperature -= 0.05,
+            HotkeyAction::IncrementTopP => state.config.chat.top_p += 0.05,
+            HotkeyAction::DecrementTopP => state.config.chat.top_p -= 0.05,
+            HotkeyAction::IncrementFrequencyPenalty => state.config.chat.frequency_penalty += 0.05,
+            HotkeyAction::DecrementFrequencyPenalty => state.config.chat.frequency_penalty -= 0.05,
+            HotkeyAction::IncrementPresencePenalty => state.config.chat.presence_penalty += 0.05,
+            HotkeyAction::DecrementPresencePenalty => state.config.chat.presence_penalty -= 0.05,
+            _ => (),
+        },
         _ => (),
     };
     Ok(HandleEventResult::None)
@@ -86,20 +204,28 @@ async fn handle_conversation_keys(
     key_event: KeyEvent,
     state: &mut State,
     ui_state: &mut UiState<'_>,
+    keymap: &HotkeyMap,
 ) -> Result<HandleEventResult> {
-    match (key_event.code, key_event.modifiers) {
-        (KeyCode::Enter, KeyModifiers::ALT) => {
-            let message = GptMessage::new_user_message(ui_state.textarea.lines().join("\n"));
-            state.conversation.add_message(message);
-            do_prompt(state, ui_state).await?;
-        }
-        (KeyCode::Char('e'), KeyModifiers::ALT) => {
-            let message_text = get_message_text_from_editor().context("get message text from editor")?;
-            ui_state.textarea.select_all();
-            ui_state.textarea.cut();
-            ui_state.textarea.insert_str(&message_text);
-            return Ok(HandleEventResult::Redraw);
-        }
+    let is_hotkey = keymap.keymap.get(&(key_event.code, key_event.modifiers));
+    match (is_hotkey, key_event.code, key_event.modifiers) {
+        (Some(hotkey_action), _, _) => match *hotkey_action {
+            HotkeyAction::SendPrompt => {
+                let message = GptMessage::new_user_message(ui_state.textarea.lines().join("\n"));
+                state.conversation.add_message(message);
+                do_prompt(state, ui_state).await?;
+            }
+            HotkeyAction::GetMessageFromEditor => {
+                let message_text =
+                    get_message_text_from_editor().context("get message text from editor")?;
+                ui_state.textarea.select_all();
+                ui_state.textarea.cut();
+                ui_state.textarea.insert_str(&message_text);
+                return Ok(HandleEventResult::Redraw);
+            }
+            _ => {
+                ui_state.textarea.input(key_event);
+            }
+        },
         _ => {
             ui_state.textarea.input(key_event);
         }
@@ -111,13 +237,24 @@ fn get_message_text_from_editor() -> Result<String> {
     let editor = std::env::var("EDITOR").context("get EDITOR environment variable")?;
     let user_home_dir = std::env::var("HOME").context("get HOME environment variable")?;
     let message_file = std::path::Path::new(&user_home_dir).join(MESSAGE_FILE);
-    let message_dir = message_file.parent().expect("get message file parent directory");
+    let message_dir = message_file
+        .parent()
+        .expect("get message file parent directory");
     std::fs::create_dir_all(message_dir).context("create directory for message file")?;
-    let editor_process_output = std::process::Command::new(editor).arg(&message_file).output().context("run editor")?;
+    let editor_process_output = std::process::Command::new(editor)
+        .arg(&message_file)
+        .output()
+        .context("run editor")?;
     if !editor_process_output.status.success() {
-        anyhow::bail!(format!("editor process failed: {}", editor_process_output.status));
+        anyhow::bail!(format!(
+            "editor process failed: {}",
+            editor_process_output.status
+        ));
     }
-    let message_text = std::fs::read_to_string(message_file).context("read message text from file")?.trim().to_owned();
+    let message_text = std::fs::read_to_string(message_file)
+        .context("read message text from file")?
+        .trim()
+        .to_owned();
     Ok(message_text)
 }
 
